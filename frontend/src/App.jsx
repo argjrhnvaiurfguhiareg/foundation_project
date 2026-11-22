@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import Sidebar from './components/Sidebar';
 import ChatHeader from './components/ChatHeader';
 import ChatMessages from './components/ChatMessages';
@@ -7,102 +7,264 @@ import SourceViewer from './components/SourceViewer';
 
 export default function App() {
   const [isDarkMode, setIsDarkMode] = useState(true);
-  const [selectedSource, setSelectedSource] = useState(null); // { document, highlightHeader }
-  const API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+  const [chats, setChats] = useState([]);
+  const [activeChatId, setActiveChatId] = useState(null);
+  const [messages, setMessages] = useState([]);
   const [sourceRefs, setSourceRefs] = useState([]);
+  const [selectedSource, setSelectedSource] = useState(null);
+  const [isTyping, setIsTyping] = useState(false);
 
-  const [messages, setMessages] = useState([
-    {
-      id: 1,
-      sender: 'user',
-      time: '12:40',
-      text: 'Съезжаю с квартиры. Собственник не хочет возвращать залог: говорит, что нужен клининг, хотя повреждений нет. Что мне делать?'
-    },
-    {
-      id: 2,
-      sender: 'ai',
-      time: '12:41',
-      verdict: 'Самого желания провести клининг недостаточно для удержания залога.',
-      intro: 'Если квартира находится в России, начните с договора и фиксации её состояния. Вот что можно сделать:',
-      steps: [
-        { num: 1, title: "Проверьте договор", text: "Посмотрите, как в договоре названа сумма и в каких случаях её можно удержать." },
-        { num: 2, title: "Зафиксируйте состояние квартиры", text: "Сделайте фото и видео, сохраните переписку. При передаче ключей предложите подписать акт." },
-        { num: 3, title: "Попросите обосновать удержание", text: "Направьте собственнику письменное требование вернуть деньги." }
-      ],
-      prompt: 'Есть ли в договоре условие об оплате уборки при выезде? Можете прислать его текст без личных данных.'
+  const activeChat = chats.find((c) => c.id === activeChatId) || {
+    title: 'Новый диалог',
+    subtitle: 'Юридическая консультация · Контекст: ГК РФ и ТК РФ',
+  };
+
+  useEffect(() => {
+    const root = window.document.documentElement;
+    if (isDarkMode) {
+      root.classList.add('dark');
+    } else {
+      root.classList.remove('dark');
     }
-  ]);
+  }, [isDarkMode]);
 
-  const handleSendMessage = async (text) => {
-    const timeNow = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    const history = messages.slice(-6);
-    setMessages(prev => [...prev, { id: Date.now(), sender: 'user', time: timeNow, text }]);
+  const loadChatMessages = useCallback(async (chatId) => {
     try {
-      const res = await fetch(API + '/api/chat', {
+      const res = await fetch(`/api/chats/${chatId}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setActiveChatId(data.id);
+      setMessages(data.messages || []);
+      setSelectedSource(null);
+
+      // Подтягиваем источники из последнего ответа ассистента
+      const lastAiMsg = [...(data.messages || [])].reverse().find((m) => m.role === 'ai');
+      setSourceRefs(lastAiMsg?.sources || []);
+    } catch (err) {
+      console.error('Ошибка загрузки сообщений чата:', err);
+    }
+  }, []);
+
+  const handleNewChat = useCallback(async () => {
+    try {
+      const res = await fetch('/api/chats', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text, history })
+        body: JSON.stringify({
+          title: 'Новый диалог',
+          subtitle: 'Юридическая консультация · Контекст: ГК РФ и ТК РФ',
+        }),
       });
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const data = await res.json();
-      setMessages(prev => [...prev, { id: Date.now() + 1, sender: 'ai', time: timeNow, verdict: data.verdict, intro: data.intro, steps: data.steps || [], prompt: data.prompt }]);
-      setSourceRefs(data.sources || []);
-    } catch (e) {
-      setMessages(prev => [...prev, { id: Date.now() + 1, sender: 'ai', time: timeNow, verdict: 'Нет связи с сервером', intro: String(e), steps: [], prompt: '' }]);
+      if (!res.ok) throw new Error('Не удалось создать диалог');
+      const created = await res.json();
+
+      setChats((prev) => [created, ...prev]);
+      setActiveChatId(created.id);
+      setMessages([]);
       setSourceRefs([]);
+      setSelectedSource(null);
+    } catch (err) {
+      console.error('Ошибка создания нового чата:', err);
+    }
+  }, []);
+
+  // Первичная инициализация списка чатов
+  useEffect(() => {
+    let isMounted = true;
+    async function initChats() {
+      try {
+        const res = await fetch('/api/chats');
+        if (!res.ok) return;
+        const data = await res.json();
+        const existingChats = data.chats || [];
+
+        if (!isMounted) return;
+
+        if (existingChats.length > 0) {
+          setChats(existingChats);
+          await loadChatMessages(existingChats[0].id);
+        } else {
+          await handleNewChat();
+        }
+      } catch (err) {
+        console.error('Ошибка инициализации чатов:', err);
+      }
+    }
+    initChats();
+    return () => {
+      isMounted = false;
+    };
+  }, [loadChatMessages, handleNewChat]);
+
+  // Горячая клавиша Cmd+K / Ctrl+K для создания нового диалога
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        handleNewChat();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [handleNewChat]);
+
+  const handleDeleteChat = async (chatId, e) => {
+    e.stopPropagation();
+    try {
+      const res = await fetch(`/api/chats/${chatId}`, { method: 'DELETE' });
+      if (!res.ok) return;
+
+      const updatedChats = chats.filter((c) => c.id !== chatId);
+      setChats(updatedChats);
+
+      if (activeChatId === chatId) {
+        if (updatedChats.length > 0) {
+          await loadChatMessages(updatedChats[0].id);
+        } else {
+          await handleNewChat();
+        }
+      }
+    } catch (err) {
+      console.error('Ошибка удаления чата:', err);
+    }
+  };
+
+  const handleSelectSource = async (sourceRef) => {
+    setSelectedSource({
+      id: sourceRef.docId,
+      doc_name: sourceRef.title,
+      title: sourceRef.article,
+      date: '2026',
+      edition: 'Действующая редакция',
+      highlightHeader: sourceRef.header || `${sourceRef.title} > ${sourceRef.article}`,
+      sections: [{ header: sourceRef.article, text: 'Загрузка текста документа из базы знаний...' }],
+    });
+
+    try {
+      const res = await fetch(`/api/documents/${encodeURIComponent(sourceRef.docId)}`);
+      if (!res.ok) throw new Error('Документ не найден');
+      const doc = await res.json();
+      setSelectedSource({
+        ...doc,
+        highlightHeader: sourceRef.header || `${sourceRef.title} > ${sourceRef.article}`,
+      });
+    } catch {
+      setSelectedSource((prev) =>
+        prev
+          ? {
+              ...prev,
+              sections: [
+                {
+                  header: sourceRef.article,
+                  text: sourceRef.quote || 'Не удалось загрузить полный текст документа.',
+                },
+              ],
+            }
+          : null
+      );
     }
   };
 
 
+  const handleSend = async (text) => {
+    const nowTime = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    const userMsg = { id: Date.now(), role: 'user', text, time: nowTime };
+    const nextMessages = [...messages, userMsg];
+    setMessages(nextMessages);
+    setIsTyping(true);
 
-  const openSource = async (ref) => {
     try {
-      const res = await fetch(API + '/api/documents/' + ref.docId);
-      if (!res.ok) throw new Error('not found');
-      const document = await res.json();
-      setSelectedSource({ document, highlightHeader: ref.header });
-    } catch (e) {
-      alert('Не удалось загрузить документ');
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: activeChatId,
+          message: text,
+          history: nextMessages.slice(-6).map((m) => ({ role: m.role, text: m.text })),
+        }),
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || `Ошибка сервера (${res.status})`);
+      }
+
+      const data = await res.json();
+      const newSources = data.sources || [];
+
+      setActiveChatId(data.chat_id);
+      setChats((prev) => {
+        const exists = prev.some((c) => c.id === data.chat_id);
+        if (!exists) {
+          return [
+            { id: data.chat_id, title: data.title, subtitle: 'Юридическая консультация' },
+            ...prev,
+          ];
+        }
+        return prev.map((c) => (c.id === data.chat_id ? { ...c, title: data.title } : c));
+      });
+
+      setSourceRefs(newSources);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: Date.now() + 1,
+          role: 'ai',
+          text: data.answer,
+          time: new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }),
+          sources: newSources,
+        },
+      ]);
+    } catch (error) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: Date.now() + 1,
+          role: 'ai',
+          text: `Не удалось получить ответ от сервера: ${error.message}. Убедитесь, что бэкенд запущен и индекс загружен.`,
+          time: new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }),
+        },
+      ]);
+    } finally {
+      setIsTyping(false);
     }
   };
 
   return (
-    <div className={`flex h-screen w-screen overflow-hidden ${isDarkMode ? 'dark bg-gray-900 text-gray-100' : 'bg-white text-slate-800'}`}>
-      <Sidebar isDarkMode={isDarkMode} setIsDarkMode={setIsDarkMode} />
+    <div className="flex h-screen w-screen overflow-hidden bg-slate-50 dark:bg-[#0B0F17] text-slate-900 dark:text-slate-100 font-sans transition-colors duration-200">
+      <Sidebar
+        isDarkMode={isDarkMode}
+        setIsDarkMode={setIsDarkMode}
+        chats={chats}
+        activeChatId={activeChatId}
+        onSelectChat={loadChatMessages}
+        onNewChat={handleNewChat}
+        onDeleteChat={handleDeleteChat}
+      />
 
-      {/* Контейнер: чат + панель-просмотр */}
-      <div className="flex flex-1 h-full min-w-0">
-        <main className="flex flex-col flex-1 h-full min-w-0 bg-white dark:bg-gray-900">
-          <ChatHeader />
-          <div className="flex-1 overflow-y-auto px-4 md:px-20 py-6 max-w-4xl w-full mx-auto">
-            <ChatMessages messages={messages} />
+      <main className="flex-1 flex flex-col min-w-0 bg-white dark:bg-[#0D131F] relative transition-colors duration-200">
+        <ChatHeader title={activeChat.title} subtitle={activeChat.subtitle} />
+        <ChatMessages
+          messages={messages}
+          isTyping={isTyping}
+          sourceRefs={sourceRefs}
+          selectedSource={selectedSource}
+          onSelectSource={handleSelectSource}
+          onQuickPrompt={handleSend}
+        />
+        <ChatInput onSend={handleSend} disabled={isTyping} />
+      </main>
 
-            {/* Блок кликабельных источников ответа */}
-            <div className="mt-4 flex flex-wrap gap-2 items-center">
-              <span className="text-xs text-slate-500 dark:text-gray-400">📎 Подтверждающие документы:</span>
-              {sourceRefs.map((ref, i) => (
-                <button
-                  key={i}
-                  onClick={() => openSource(ref)}
-                  className="text-xs px-3 py-1 rounded-full bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-900 hover:bg-emerald-100 dark:hover:bg-emerald-900/60 transition-colors"
-                >
-                  {ref.label}
-                </button>
-              ))}
-            </div>
-          </div>
-          <ChatInput onSend={handleSendMessage} />
-        </main>
+      {selectedSource && (
+        <SourceViewer
+          document={selectedSource}
+          highlightHeader={selectedSource.highlightHeader}
+          onClose={() => setSelectedSource(null)}
+        />
+      )}
 
-        {/* Панель-просмотр справа (появляется при клике на источник) */}
-        {selectedSource && (
-          <SourceViewer
-            document={selectedSource.document}
-            highlightHeader={selectedSource.highlightHeader}
-            onClose={() => setSelectedSource(null)}
-          />
-        )}
-      </div>
+
     </div>
   );
 }
+
